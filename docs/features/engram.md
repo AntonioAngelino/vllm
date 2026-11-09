@@ -172,6 +172,13 @@ and falls back to per-replica (or DP-sharded) tables with a warning when:
 Requirements: `cpu_offload` enabled, `--data-parallel-size > 1`, and a shared
 IPC namespace across the co-located replicas.
 
+For Qwen4Exp PLE tables this also works with independent DP ranks
+(`--data-parallel-independent-moe`), which have no DP group: the co-located
+ranks form a CPU-only group on the loopback only while the table loads, so the
+replicas share one table without any collective at runtime. They must share a
+network namespace as well as the IPC one. A table loaded this way cannot be
+reloaded in place while the ranks serve; restart them to load new weights.
+
 ## Limitations
 
 - CUDA-alike platforms only.

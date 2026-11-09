@@ -14,6 +14,20 @@ In vLLM, each DP rank is deployed as a separate "core engine" process that commu
 
 For MoE models, when any requests are in progress in any rank, we must ensure that empty "dummy" forward passes are performed in all ranks that don't currently have any requests scheduled. This is handled via a separate DP Coordinator process that communicates with all ranks, and a collective operation performed every N steps to determine when all ranks become idle and can be paused. When TP is used in conjunction with DP, expert layers form a group of size `DP × TP` (using either tensor parallelism by default, or expert parallelism if `--enable-expert-parallel` is set).
 
+### Independent MoE ranks
+
+With `--data-parallel-independent-moe`, the data parallel ranks of an MoE model run as those of a dense model do: each rank holds every expert (its MoE layers are tensor parallel within the rank only), runs its own engine loop, never performs dummy forward passes and never takes part in a collective with another rank. There is no wave coordination, and the DP Coordinator runs only where the internal load balancer needs its statistics. This suits a model that fits one rank's GPUs, served on nodes whose GPUs cannot reach each other quickly (or at all), where a per-layer all-gather across ranks would cost more than it saves.
+
+```bash
+vllm serve $MODEL --data-parallel-size 2 --data-parallel-independent-moe
+```
+
+It cannot be combined with `--enable-expert-parallel`, EPLB, elastic EP, fault tolerance or a non-default `--all2all-backend`, all of which shard or coordinate experts across ranks.
+
+Co-located ranks still share what they can on the host: an Engram/PLE table offloaded with `dp_shared_memory` (see [Engram](../features/engram.md)) is mapped once per node. Because the ranks have no DP group, the co-located ranks form a CPU-only group (a loopback TCPStore, no torch process group) while the table loads, the first of them loading it, and close it once the model is loaded. The ranks a launcher starts on a node share a table, and so do the external-LB ranks that `--nnodes` places on one node (`--data-parallel-size / --nnodes` consecutive ranks per node, so `--data-parallel-multi-port-external-lb` on one node shares one table between its children). Ray-placed ranks keep a table each. The loading group listens on the loopback ports after `--data-parallel-rpc-port` (one per worker of a rank; move them with that option when two deployments share a host). Co-located ranks wait for each other at most five minutes; a peer that does not come (a rank restarted while the others serve, or `--nnodes` not describing an external-LB deployment) leaves each rank its own table.
+
+Independent ranks work with every load balancing mode below. With internal load balancing, a router can still pin a session to a rank by setting the `X-data-parallel-rank` request header; with external load balancing, each rank's server starts and serves on its own, without contacting rank 0.
+
 In all cases, it is beneficial to load-balance requests between DP ranks. For online deployments, this balancing can be optimized by taking into account the state of each DP engine - in particular its currently scheduled and waiting (queued) requests, and KV cache state. Each DP engine has an independent KV cache, and the benefit of prefix caching can be maximized by directing prompts intelligently.
 
 This document focuses on online deployments (with the API server). DP + EP is also supported for offline usage (via the LLM class), for an example see [examples/features/data_parallel/data_parallel_offline.py](../../examples/features/data_parallel/data_parallel_offline.py).
