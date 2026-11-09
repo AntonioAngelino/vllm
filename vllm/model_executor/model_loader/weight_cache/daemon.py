@@ -631,10 +631,11 @@ def plan_local_ranks(
 def get_engine_dp_placement(vllm_config: VllmConfig, dp_rank: int) -> tuple[int, int]:
     """`(dp_size, dp_rank)` as the engine fingerprints this DP rank.
 
-    The engine runs the DP ranks of a non-MoE target as independent DP=1
-    replicas, so their workers all report `(1, 0)`.
+    The engine runs the DP ranks of a non-MoE target, and of an MoE one with
+    `data_parallel_independent_moe`, as independent DP=1 replicas, so their
+    workers all report `(1, 0)`.
     """
-    if vllm_config.model_config.is_moe:
+    if vllm_config.parallel_config.uses_dp_lockstep(vllm_config.model_config.is_moe):
         return vllm_config.parallel_config.data_parallel_size, dp_rank
     return 1, 0
 

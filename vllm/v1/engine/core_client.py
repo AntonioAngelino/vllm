@@ -170,6 +170,13 @@ class EngineCoreClient(ABC):
         )
         if parallel_config.data_parallel_size > 1:
             if parallel_config.data_parallel_external_lb:
+                if parallel_config.data_parallel_independent_moe:
+                    # An independent rank behind an external load balancer:
+                    # one engine, no coordinator, as if DP were 1.
+                    return AsyncMPClient(
+                        *client_args,
+                        renderer=renderer,
+                    )
                 # External load balancer - client per DP rank.
                 return DPAsyncMPClient(
                     *client_args,

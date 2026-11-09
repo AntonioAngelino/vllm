@@ -198,6 +198,15 @@ class ParallelConfig:
     """
     enable_expert_parallel: bool = False
     """Use expert parallelism instead of tensor parallelism for MoE layers."""
+    data_parallel_independent_moe: bool = False
+    """Run the data parallel ranks of an MoE model independently, as dense
+    models run them: each rank holds every expert, steps on its own schedule and
+    never joins another rank in a collective, so there are no dummy batches and
+    no all-gather or reduce-scatter across ranks in the MoE layers. Co-located
+    ranks still map one CPU-offloaded Engram/PLE table (with
+    `EngramConfig.dp_shared_memory`) through a CPU-only group that is formed
+    while the table loads and closed afterwards. Incompatible with expert
+    parallelism. Useful where the GPUs of a node cannot reach each other."""
     enable_batch_sharded_sampling: bool | None = None
     """Use sharded sampling across tensor parallel ranks. Each rank samples
     a slice of the batch instead of every rank sampling all of it. Currently
@@ -427,6 +436,17 @@ class ParallelConfig:
     """Port of the coordination TCPStore. Can be set by the API server; workers
     connect as clients to exchange self-picked group ports at runtime."""
 
+    _independent_dp_group_ports: list[int] = Field(default_factory=list)
+    """With `data_parallel_independent_moe`, the loopback port of each worker's
+    node-local table-loading group, indexed by the worker's rank in its replica:
+    the ports after `data_parallel_rpc_port`, so that co-located ranks agree
+    without asking anybody, whichever process launched them."""
+
+    _independent_dp_node_group: tuple[int, int] | None = None
+    """With `data_parallel_independent_moe`, this rank's index among the
+    co-located DP ranks and their number, captured before the rank's DP fields
+    are reset. None when the rank has no co-located peer."""
+
     decode_context_parallel_size: int = Field(default=1, ge=1)
     """Number of ranks that shard the decode KV cache. DCP does not expand
     the process world size. Without PCP, DCP reuses TP ranks. With PCP, DCP
@@ -594,6 +614,9 @@ class ParallelConfig:
                 "data_parallel_external_lb can only be set when data_parallel_size > 1"
             )
 
+        if self.data_parallel_independent_moe:
+            self._validate_independent_moe()
+
         if self.numa_bind_nodes is not None or self.numa_bind_cpus is not None:
             if self.numa_bind is False:
                 raise ValueError(
@@ -750,6 +773,44 @@ class ParallelConfig:
             if not steady_state_entered():
                 return None
         return self.cpu_distributed_timeout
+
+    def _validate_independent_moe(self) -> None:
+        """Refuse what needs MoE layers to span the data parallel ranks."""
+        conflicts = [
+            name
+            for name, enabled in (
+                ("--enable-expert-parallel", self.enable_expert_parallel),
+                ("--enable-eplb", self.enable_eplb),
+                ("--enable-elastic-ep", self.enable_elastic_ep),
+                # It recovers lockstep ranks from an EP peer's fault.
+                ("--enable-fault-tolerance", self.enable_fault_tolerance),
+            )
+            if enabled
+        ]
+        if self.all2all_backend != "allgather_reducescatter":
+            conflicts.append(f"--all2all-backend {self.all2all_backend}")
+        if conflicts:
+            raise ValueError(
+                "--data-parallel-independent-moe runs every data parallel rank "
+                "with all the experts and no collective across ranks, so it "
+                "cannot be combined with " + ", ".join(conflicts) + ". Drop "
+                "--data-parallel-independent-moe to shard experts across ranks."
+            )
+        if self.is_moe_model is False:
+            logger.info_once(
+                "--data-parallel-independent-moe has no effect on dense models, "
+                "whose data parallel ranks are always independent."
+            )
+
+    def uses_dp_lockstep(self, is_moe: bool | None) -> bool:
+        """Whether the data parallel ranks of this model step together.
+
+        MoE layers span the DP ranks, which then run in lockstep with dummy
+        batches, unless `data_parallel_independent_moe` keeps them apart. An
+        unknown model (`is_moe=None`) is treated as MoE. Callers check
+        `data_parallel_size > 1` themselves.
+        """
+        return is_moe is not False and not self.data_parallel_independent_moe
 
     def get_next_dp_init_port(self) -> int:
         """We might need to initialize process groups in multiple
@@ -1026,6 +1087,8 @@ class ParallelConfig:
             "data_parallel_master_port",
             "_data_parallel_master_port_list",
             "_coord_store_port",
+            "_independent_dp_group_ports",
+            "_independent_dp_node_group",
             "data_parallel_rpc_port",
             "rank",
             "master_addr",
@@ -1111,6 +1174,18 @@ class ParallelConfig:
                 self.data_parallel_master_port = (
                     self._data_parallel_master_port_list.pop()
                 )
+            if (
+                self.data_parallel_independent_moe
+                and not self._independent_dp_group_ports
+            ):
+                # Fixed rather than probed: external-LB ranks are separate
+                # servers, and a probed port (scanned from VLLM_PORT when it is
+                # set) can be taken by the executor's own store before the
+                # table loads.
+                self._independent_dp_group_ports = [
+                    self.data_parallel_rpc_port + 1 + rank
+                    for rank in range(self.world_size)
+                ]
 
             if not (0 <= self.data_parallel_rank < self.data_parallel_size):
                 raise ValueError(
@@ -1287,15 +1362,51 @@ class ParallelConfig:
         return self
 
     def reconfigure_for_independent_dp_rank(self) -> None:
-        """Reconfigure for a single independent non-MoE DP rank."""
+        """Reconfigure for a single independent DP rank.
+
+        Dense models always run their DP ranks independently; MoE models do
+        with `data_parallel_independent_moe`.
+        """
         # Capture these before changing DP fields.
         nnodes = self.nnodes_within_dp
         node_rank = self.node_rank_within_dp
+        if self.data_parallel_independent_moe:
+            # The engine process sets its index among its launcher's engines.
+            self._independent_dp_node_group = self._co_located_dp_ranks(
+                self.data_parallel_rank_local or 0
+            )
         self.data_parallel_size = 1
         self.data_parallel_size_local = 1
         self.data_parallel_rank = 0
         self.nnodes = nnodes
         self.node_rank = node_rank
+        if not self.enable_elastic_ep:
+            # Sized from the DP ranks one MoE call would gather, now only this one.
+            self.elastic_ep_max_dp_size = 1
+
+    def _co_located_dp_ranks(self, local_dp_rank: int) -> tuple[int, int] | None:
+        """This rank's index among the DP ranks on its node, and their number.
+
+        A launcher starts its node's ranks itself, except with an external load
+        balancer, where each rank is its own server: then `nnodes` describes
+        the deployment and its ranks fill the nodes in order. None when the
+        rank has no co-located peer, one replica spans several nodes, or Ray
+        places the ranks.
+        """
+        if (
+            self.data_parallel_size <= 1
+            or self.nnodes_within_dp > 1
+            or self.data_parallel_backend == "ray"
+        ):
+            return None
+        if not self.data_parallel_external_lb:
+            index, size = local_dp_rank, self.data_parallel_size_local
+        elif self.data_parallel_size % self.nnodes == 0:
+            size = self.data_parallel_size // self.nnodes
+            index = self.data_parallel_rank % size
+        else:
+            return None
+        return (index, size) if size > 1 else None
 
 
 def resolve_mori_all2all(

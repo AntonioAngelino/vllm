@@ -843,11 +843,12 @@ class VllmConfig:
             True if DPCoordinator process is needed, False otherwise.
 
         """
-        # For non-MoE models, only need coordinator in internal/hybrid LB mode
-        # (for stats collection).
+        # For non-MoE models, and MoE models whose DP ranks are independent,
+        # only need coordinator in internal/hybrid LB mode (for stats collection).
         return self.parallel_config.data_parallel_size > 1 and (
-            self.model_config is None
-            or self.model_config.is_moe
+            self.parallel_config.uses_dp_lockstep(
+                None if self.model_config is None else self.model_config.is_moe
+            )
             or not self.parallel_config.data_parallel_external_lb
         )
 
@@ -1634,8 +1635,11 @@ class VllmConfig:
 
         if self.parallel_config.disable_nccl_for_dp_synchronization is None:
             if self.scheduler_config.async_scheduling:
-                if self.parallel_config.data_parallel_size > 1 and (
-                    self.model_config is None or self.model_config.is_moe
+                if (
+                    self.parallel_config.data_parallel_size > 1
+                    and self.parallel_config.uses_dp_lockstep(
+                        None if self.model_config is None else self.model_config.is_moe
+                    )
                 ):
                     logger.info_once(
                         "Disabling NCCL for DP synchronization "
@@ -2061,7 +2065,9 @@ class VllmConfig:
         # Do this after all the updates to compilation_config.mode
         effective_dp_size = (
             self.parallel_config.data_parallel_size
-            if self.model_config is None or self.model_config.is_moe
+            if self.parallel_config.uses_dp_lockstep(
+                None if self.model_config is None else self.model_config.is_moe
+            )
             else 1
         )
         self.compilation_config.set_splitting_ops_for_v1(

@@ -523,7 +523,10 @@ class CoreEngineActorManager:
         dp_size = vllm_config.parallel_config.data_parallel_size
         actor_class = (
             DPMoEEngineCoreActor
-            if dp_size > 1 and vllm_config.model_config.is_moe
+            if dp_size > 1
+            and vllm_config.parallel_config.uses_dp_lockstep(
+                vllm_config.model_config.is_moe
+            )
             else EngineCoreActor
         )
 
@@ -955,7 +958,9 @@ class CoreEngineActorManager:
 
         actor_class = (
             DPMoEEngineCoreActor
-            if cur_vllm_config.model_config.is_moe
+            if cur_vllm_config.parallel_config.uses_dp_lockstep(
+                cur_vllm_config.model_config.is_moe
+            )
             else EngineCoreActor
         )
 
@@ -1265,7 +1270,9 @@ def launch_core_engines(
     if run_coordinator:
         coordinator = DPCoordinator(
             parallel_config,
-            enable_wave_coordination=vllm_config.model_config.is_moe,
+            enable_wave_coordination=parallel_config.uses_dp_lockstep(
+                vllm_config.model_config.is_moe
+            ),
             logging_config=vllm_config.logging_config,
         )
 
@@ -1313,10 +1320,18 @@ def launch_core_engines(
         )
         return
 
+    # Independent ranks behind an external load balancer share nothing at
+    # runtime, so each frontend starts and talks to its own engine alone.
+    independent_external_lb = (
+        dp_size > 1
+        and parallel_config.data_parallel_external_lb
+        and parallel_config.data_parallel_independent_moe
+    )
+
     if offline_mode:
         assert local_engine_count == 1
         engines_to_handshake = [CoreEngine(index=dp_rank, local=True)]
-    elif dp_rank == 0:
+    elif dp_rank == 0 and not independent_external_lb:
         # Rank 0 holds Coordinator, so it handshakes with all Cores
         # in both external dplb and internal dplb mode.
         # Note this also covers the case where we have zero local engines
@@ -1339,7 +1354,9 @@ def launch_core_engines(
     # front-end processes. In external_dp_lb mode, ranks > 0 handshake with
     # their co-located frontend and also the rank 0 front-end, and hence this
     # will be False.
-    handshake_local_only = offline_mode or local_engine_count == dp_size
+    handshake_local_only = (
+        offline_mode or local_engine_count == dp_size or independent_external_lb
+    )
 
     # NOTE(yongji): handling scaling from intra-node to inter-node
     if parallel_config.enable_elastic_ep:
@@ -1351,7 +1368,7 @@ def launch_core_engines(
         parallel_config.data_parallel_rpc_port,
     )
 
-    if local_engines_only and dp_rank > 0:
+    if local_engines_only and dp_rank > 0 and not independent_external_lb:
         assert not handshake_local_only
         local_handshake_address = get_open_zmq_ipc_path()
         client_handshake_address = local_handshake_address
@@ -1394,7 +1411,8 @@ def launch_core_engines(
             handshake_socket,
             engines_to_handshake,
             parallel_config,
-            dp_size > 1 and vllm_config.model_config.is_moe,
+            dp_size > 1
+            and parallel_config.uses_dp_lockstep(vllm_config.model_config.is_moe),
             vllm_config.cache_config,
             launch,
         )

@@ -563,6 +563,7 @@ class EngineArgs:
     data_parallel_backend: DataParallelBackend = ParallelConfig.data_parallel_backend
     enable_hc_sp: bool = ParallelConfig.enable_hc_sp
     enable_expert_parallel: bool = ParallelConfig.enable_expert_parallel
+    data_parallel_independent_moe: bool = ParallelConfig.data_parallel_independent_moe
     enable_batch_sharded_sampling: bool | None = (
         ParallelConfig.enable_batch_sharded_sampling
     )
@@ -1320,6 +1321,10 @@ class EngineArgs:
             "--enable-expert-parallel",
             "-ep",
             **parallel_kwargs["enable_expert_parallel"],
+        )
+        parallel_group.add_argument(
+            "--data-parallel-independent-moe",
+            **parallel_kwargs["data_parallel_independent_moe"],
         )
         parallel_group.add_argument(
             "--enable-batch-sharded-sampling",
@@ -2621,6 +2626,7 @@ class EngineArgs:
             is_moe_model=model_config.is_moe,
             enable_hc_sp=self.enable_hc_sp,
             enable_expert_parallel=self.enable_expert_parallel,
+            data_parallel_independent_moe=self.data_parallel_independent_moe,
             enable_batch_sharded_sampling=self.enable_batch_sharded_sampling,
             enable_ep_weight_filter=self.enable_ep_weight_filter,
             all2all_backend=self.all2all_backend,

@@ -1716,12 +1716,15 @@ class EngineCoreProc(EngineCore):
             signal.signal(signal.SIGINT, signal_handler)
 
             parallel_config.data_parallel_index = dp_rank
-            if data_parallel and vllm_config.model_config.is_moe:
+            if data_parallel and parallel_config.uses_dp_lockstep(
+                vllm_config.model_config.is_moe
+            ):
                 # Set data parallel rank for this engine process.
                 parallel_config.data_parallel_rank = dp_rank
                 engine_core = DPEngineCoreProc(*args, **kwargs)
             else:
-                # Non-MoE DP ranks are completely independent, so treat like DP=1.
+                # Dense DP ranks, and MoE ones with data_parallel_independent_moe,
+                # are completely independent, so treat like DP=1.
                 # Note that parallel_config.data_parallel_index will still reflect
                 # the original DP rank.
                 parallel_config.reconfigure_for_independent_dp_rank()
