@@ -106,7 +106,12 @@ class EngramConfig:
     def verify_parallel_config(self, parallel_config: "ParallelConfig") -> None:
         """Reject unsupported embedding parallel topologies."""
         if self.dp_shared_memory:
-            if parallel_config.data_parallel_size <= 1:
+            # An independent DP rank runs as DP=1 (the engine re-verifies its
+            # config after the reset) yet still shares with its co-located peers.
+            if (
+                parallel_config.data_parallel_size <= 1
+                and parallel_config._independent_dp_node_group is None
+            ):
                 raise ValueError("dp_shared_memory requires data_parallel_size > 1.")
             if parallel_config.enable_elastic_ep:
                 raise ValueError("dp_shared_memory is not supported with elastic EP.")

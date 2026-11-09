@@ -63,6 +63,7 @@ from vllm.utils.torch_utils import (
 )
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
     from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 
 
@@ -881,6 +882,14 @@ class GroupCoordinator:
             )
             return recv[0]
 
+    def all_gather_object(self, obj: Any) -> list[Any]:
+        """Gather one picklable object from every rank, over the CPU group."""
+        if self.world_size == 1:
+            return [obj]
+        gathered: list[Any] = [None] * self.world_size
+        torch.distributed.all_gather_object(gathered, obj, group=self.cpu_group)
+        return gathered
+
     def broadcast_object_list(
         self, obj_list: list[Any], src: int = 0, group: ProcessGroup | None = None
     ):
@@ -1626,6 +1635,155 @@ def get_engram_dp_size() -> int:
     return _ENGRAM_DP.world_size if _ENGRAM_DP is not None else 1
 
 
+class NodeLocalLoadGroup:
+    """CPU-only group of co-located independent DP ranks, used while loading.
+
+    Independent DP ranks (`ParallelConfig.data_parallel_independent_moe`) have
+    no DP group, so the ranks that map one host table form this one instead: a
+    TCPStore on the loopback with no torch process group and no device
+    communicator, so it can never issue a GPU collective. It offers the part of
+    `GroupCoordinator` that mapping and loading a shared table uses, and is
+    released once the model is loaded.
+    """
+
+    def __init__(self, group: StatelessProcessGroup, timeout_s: float) -> None:
+        self._group: StatelessProcessGroup | None = group
+        self._timeout_s = timeout_s
+        self.rank_in_group = group.rank
+        self.world_size = group.world_size
+
+    @property
+    def released(self) -> bool:
+        return self._group is None
+
+    def _live(self) -> StatelessProcessGroup:
+        if self._group is None:
+            raise RuntimeError(
+                "The node-local table-loading group of independent DP ranks was "
+                "released after loading; shared tables cannot be loaded again."
+            )
+        return self._group
+
+    def broadcast_object(self, obj: Any | None = None, src: int = 0) -> Any:
+        return self._live().broadcast_obj(obj, src=src)
+
+    def all_gather_object(self, obj: Any) -> list[Any]:
+        return self._live().all_gather_obj(obj)
+
+    def barrier(self) -> None:
+        self._live().barrier(timeout=self._timeout_s)
+
+    def destroy(self) -> None:
+        self._group = None
+
+
+# How long co-located independent ranks wait for each other to form the group.
+# Short on purpose: a peer that is not coming (a misdescribed node, a rank
+# restarted while the others serve) costs this, then a table of its own.
+ENGRAM_LOAD_GROUP_FORM_TIMEOUT_S = 300
+
+_ENGRAM_LOAD: NodeLocalLoadGroup | None = None
+# Whether formation was attempted, so a failure is not retried (and waited for)
+# once per table.
+_ENGRAM_LOAD_TRIED = False
+
+
+def _engram_table_only_shared_over_dp(config: "VllmConfig") -> bool:
+    """Whether the model's Engram tables are shared, never sharded, over DP.
+
+    Qwen4Exp's CPU-offloaded PLE table is only mapped once per node over the
+    Engram DP group; DeepSeek V4.1 also shards heads across it at runtime.
+    """
+    engram_config = config.engram_config
+    return (
+        engram_config is not None
+        and config.model_config is not None
+        and config.model_config.architecture
+        in ("Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration")
+        and engram_config.dp_shared_memory
+        and not engram_config.embedding_across_dp
+    )
+
+
+def get_engram_table_group() -> "GroupCoordinator | NodeLocalLoadGroup | None":
+    """Return the co-located ranks that map one host Engram/PLE table.
+
+    That is the Engram DP group when it exists. Independent DP ranks have none,
+    so on first use (while the model is built) the co-located ranks form a
+    CPU-only `NodeLocalLoadGroup`, released by `release_engram_load_group()`
+    once the model is loaded. None when there is no such group, or it could
+    not be formed, in which case every rank keeps its own table.
+    """
+    if _ENGRAM_DP is not None:
+        return _ENGRAM_DP
+    global _ENGRAM_LOAD, _ENGRAM_LOAD_TRIED
+    if not _ENGRAM_LOAD_TRIED:
+        _ENGRAM_LOAD_TRIED = True
+        _ENGRAM_LOAD = _form_engram_load_group()
+    return _ENGRAM_LOAD
+
+
+def _form_engram_load_group() -> NodeLocalLoadGroup | None:
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    if config is None:
+        return None
+    parallel_config = config.parallel_config
+    node_group = parallel_config._independent_dp_node_group
+    if (
+        not parallel_config.data_parallel_independent_moe
+        or node_group is None
+        or not _engram_table_only_shared_over_dp(config)
+    ):
+        return None
+    index, size = node_group
+    world_rank = get_world_group().rank_in_group
+    ports = parallel_config._independent_dp_group_ports
+    if world_rank >= len(ports):
+        logger.warning(
+            "Keeping one Engram table per independent DP rank: no port was "
+            "allocated for worker rank %d.",
+            world_rank,
+        )
+        return None
+    # Loading the table may take minutes on the leader while the others wait.
+    timeout = parallel_config.cpu_distributed_timeout or timedelta(minutes=30)
+    try:
+        group = StatelessProcessGroup.create(
+            host="127.0.0.1",
+            port=ports[world_rank],
+            rank=index,
+            world_size=size,
+            store_timeout=ENGRAM_LOAD_GROUP_FORM_TIMEOUT_S,
+        )
+        group.store.set_timeout(timeout)
+    except Exception as exc:
+        logger.warning(
+            "Keeping one Engram table per independent DP rank: the %d co-located "
+            "ranks could not form a loading group on 127.0.0.1:%d: %s",
+            size,
+            ports[world_rank],
+            exc,
+        )
+        return None
+    logger.info(
+        "Independent DP rank %d of %d on this node joined the CPU-only "
+        "table-loading group",
+        index,
+        size,
+    )
+    return NodeLocalLoadGroup(group, timeout.total_seconds())
+
+
+def release_engram_load_group() -> None:
+    """Close the loading group of independent DP ranks; tables stay mapped."""
+    global _ENGRAM_LOAD
+    if _ENGRAM_LOAD is not None:
+        _ENGRAM_LOAD.destroy()
+    _ENGRAM_LOAD = None
+
+
 _DCP: GroupCoordinator | None = None
 
 
@@ -2220,12 +2378,7 @@ def initialize_model_parallel(
             config.model_config.architecture == "DeepseekV41ForCausalLM"
             # Qwen4Exp only shares its PLE table over this group. embedding_across_dp
             # spreads the table's vocab over the DP ranks, so they hold different rows.
-            or (
-                config.model_config.architecture
-                in ("Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration")
-                and engram_config.dp_shared_memory
-                and not engram_config.embedding_across_dp
-            )
+            or _engram_table_only_shared_over_dp(config)
         )
         and not enable_elastic_ep
     ):
@@ -2533,10 +2686,12 @@ def destroy_model_parallel():
         _PP.destroy()
     _PP = None
 
-    global _DP, _ENGRAM_DP
+    global _DP, _ENGRAM_DP, _ENGRAM_LOAD_TRIED
     if _ENGRAM_DP and _ENGRAM_DP is not _DP:
         _ENGRAM_DP.destroy()
     _ENGRAM_DP = None
+    release_engram_load_group()
+    _ENGRAM_LOAD_TRIED = False
     if _DP:
         _DP.destroy()
     _DP = None

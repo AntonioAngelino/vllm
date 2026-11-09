@@ -18,10 +18,11 @@ from torch import nn
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.distributed import (
     get_dp_group,
-    get_engram_dp_group,
+    get_engram_table_group,
     get_etp_group,
     get_tp_group,
 )
+from vllm.distributed.parallel_state import NodeLocalLoadGroup
 from vllm.forward_context import DPMetadata, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
@@ -864,11 +865,13 @@ class Qwen4ExpPLESharedHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
     With `EngramConfig.dp_shared_memory`, the node-local Engram DP group maps
     each table from one /dev/shm file (as DeepSeek V4.1's Engram does), so
     lookups are the pinned backend's; only the group leader loads it. A table
-    that cannot be shared stays per rank.
+    that cannot be shared stays per rank. Independent DP ranks
+    (`data_parallel_independent_moe`) do the same over the CPU-only group they
+    form while loading, so nothing here ever runs a collective after the load.
     """
 
     def __init__(self, *args, **kwargs) -> None:
-        group = get_engram_dp_group()
+        group = get_engram_table_group()
         assert group is not None, "dp_shared_memory requires the Engram DP group"
         self._shared_group = group
         self._shared_ptrs: set[int] = set()
@@ -904,8 +907,17 @@ class Qwen4ExpPLESharedHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         if param.data_ptr() not in self._shared_ptrs:
             super().weight_loader(param, loaded_weight, checkpoint_start)
             return
+        if (
+            isinstance(self._shared_group, NodeLocalLoadGroup)
+            and self._shared_group.released
+        ):
+            # Co-located independent ranks serve from this table right now.
+            raise RuntimeError(
+                "A PLE table shared by independent DP ranks cannot be reloaded "
+                "while they run; restart the ranks to load new weights."
+            )
         if self._shared_group.rank_in_group == 0:
             super().weight_loader(param, loaded_weight, checkpoint_start)
         # Read order may differ across ranks. Equal load counts ensure all shared
         # tables are ready after the last weight-loader call returns.
-        torch.distributed.barrier(group=self._shared_group.cpu_group)
+        self._shared_group.barrier()

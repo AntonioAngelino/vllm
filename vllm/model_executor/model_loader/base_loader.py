@@ -11,6 +11,7 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
+from vllm.distributed.parallel_state import release_engram_load_group
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.reload import finalize_layerwise_processing
 from vllm.model_executor.model_loader.utils import (
@@ -125,6 +126,9 @@ class BaseModelLoader(ABC):
             gc.collect()
             torch.accelerator.empty_cache()
 
+        # Independent DP ranks share host tables over a group used only to
+        # load them; nothing may run on it once the ranks serve.
+        release_engram_load_group()
         return model.eval()
 
 

@@ -44,7 +44,11 @@ from vllm.distributed.device_communicators.shm_broadcast import (
     SHM_PATH,
     check_shm_free_space,
 )
-from vllm.distributed.parallel_state import GroupCoordinator, in_the_same_node_as
+from vllm.distributed.parallel_state import (
+    GroupCoordinator,
+    NodeLocalLoadGroup,
+    in_the_same_node_as,
+)
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
@@ -655,10 +659,11 @@ def describe_error(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
-def gather_errors(group: GroupCoordinator, error: str | None) -> str:
+def gather_errors(
+    group: GroupCoordinator | NodeLocalLoadGroup, error: str | None
+) -> str:
     """Each rank's error, joined; empty if every rank succeeded."""
-    errors: list[str | None] = [None] * group.world_size
-    torch.distributed.all_gather_object(errors, error, group=group.cpu_group)
+    errors: list[str | None] = group.all_gather_object(error)
     return "; ".join(
         f"EDP rank {rank}: {error}" for rank, error in enumerate(errors) if error
     )
@@ -735,9 +740,12 @@ class DPSharedEngramStorage:
 
     @staticmethod
     def share_shm_table(
-        num_bytes: int, group: GroupCoordinator
+        num_bytes: int, group: GroupCoordinator | NodeLocalLoadGroup
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Map and register one /dev/shm file across a node-local DP group.
+
+        The group may be the Engram DP group or, for independent DP ranks, the
+        CPU-only group they form while loading; only its CPU side is used.
 
         Returns CPU and GPU views of the file. Raises on every rank, leaving
         nothing mapped, if any rank fails.
