@@ -5,6 +5,7 @@
 import mmap
 import os
 from collections.abc import Iterable
+from functools import partial
 
 import torch
 from torch import nn
@@ -26,11 +27,13 @@ from ..common.ngram_embedding import (
     Qwen4ExpPLEDeviceEmbedding,
     Qwen4ExpPLEEmbedding,
     Qwen4ExpPLEEmbeddingMethod,
+    Qwen4ExpPLEFileSharedHostEmbedding,
     Qwen4ExpPLEFp8EmbeddingMethod,
     Qwen4ExpPLENvFp4EmbeddingMethod,
     Qwen4ExpPLEPinnedHostEmbedding,
     Qwen4ExpPLESharedHostEmbedding,
     Qwen4ExpPLEUnquantizedEmbeddingMethod,
+    SharedPLETable,
 )
 from ..common.ops.ple import ple_ngram_ids
 
@@ -41,6 +44,7 @@ __all__ = [
     "Qwen4ExpPLEEmbedding",
     "Qwen4ExpPLEEmbeddingMethod",
     "Qwen4ExpPLEDiskOffloadEmbedding",
+    "Qwen4ExpPLEFileSharedHostEmbedding",
     "Qwen4ExpPLEFp8EmbeddingMethod",
     "Qwen4ExpPLENvFp4EmbeddingMethod",
     "Qwen4ExpPLEPinnedHostEmbedding",
@@ -431,7 +435,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
-        engram_config = get_current_vllm_config().engram_config
+        vllm_config = get_current_vllm_config()
+        engram_config = vllm_config.engram_config
         embedding_cls = (
             Qwen4ExpPLEDiskOffloadEmbedding
             if engram_config is not None and engram_config.disk_offload
@@ -443,6 +448,19 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             if engram_config is not None and engram_config.cpu_offload
             else Qwen4ExpPLEDeviceEmbedding
         )
+        if (
+            embedding_cls is Qwen4ExpPLEPinnedHostEmbedding
+            and engram_config.shared_host_table_dir is not None
+        ):
+            # Independent processes share the pinned table through host files.
+            model_config = vllm_config.model_config
+            embedding_cls = partial(
+                Qwen4ExpPLEFileSharedHostEmbedding,
+                shared_table=SharedPLETable(
+                    engram_config.shared_host_table_dir,
+                    f"{model_config.model}|{model_config.revision}|{embedding_prefix}",
+                ),
+            )
         # A TP reduce-scatter covers all vocabulary owners only when ETP=TP.
         # Disk-offload ranks hold full rows, so they only shard tokens.
         self.use_reduce_scatter = (
